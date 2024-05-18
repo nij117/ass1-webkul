@@ -7,14 +7,15 @@ import os
 from random import randint
 from datetime import datetime, timedelta
 import smtplib
-from mangum import Mangum
+
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from dotenv import load_dotenv
 from random import randint
-
+import bcrypt
+import re
 app = FastAPI()
-handler = Mangum(app)
+
 # Database connection and table creation logic here (same as before)
 load_dotenv()
 
@@ -50,6 +51,27 @@ def create_table(conn):
         conn.commit()
     except sqlite3.Error as e:
         print(e)
+def initialize_database(db_file):
+    """Check if the database exists. If not, create the database and table."""
+    if not os.path.isfile(db_file):
+        # Database does not exist, create it
+        conn = create_connection(db_file)
+        if conn is not None:
+            create_table(conn)
+            print("Database and table created.")
+        else:
+            print("Error! Cannot create the database connection.")
+    else:
+        # Database exists, just connect to it
+        conn = create_connection(db_file)
+        if conn is not None:
+            print("Connected to existing database.")
+        else:
+            print("Error! Cannot create the database connection.")
+    return conn
+
+db_file = "user_data.db"
+initialize_database(db_file)
 
 class ForgotPasswordRequest(BaseModel):
     username: str
@@ -78,11 +100,11 @@ class DeleteUserRequest(BaseModel):
     username: str
     password: str
 
-def send_otp_email(receiver_email):
+def send_otp_email(receiver_email,otp):
     """ Send an OTP to the specified email and return the OTP """
     sender_email = os.getenv("EMAIL_USER")
     sender_password = os.getenv("EMAIL_PASSWORD")
-    otp = randint(100000, 999999)  # Generate a 6-digit OTP
+    #otp = randint(100000, 999999)  # Generate a 6-digit OTP
 
     # Setup the MIME
     message = MIMEMultipart()
@@ -98,64 +120,14 @@ def send_otp_email(receiver_email):
     server.login(sender_email, sender_password)
     text = message.as_string()
     server.sendmail(sender_email, receiver_email, text)
+    print("mail is sent")
     server.quit()
 
     return otp
 # Signup function
 
-def signup(conn, username, email, password):
-    """Register a new user with email verification"""
-    otp = send_otp_email(email)
-    user_otp = input("Enter the OTP sent to your email: ")
-    if str(otp) == user_otp:
-        try:
-            cursor = conn.cursor()
-            hashed_password = hashlib.sha256(password.encode()).hexdigest()
-            cursor.execute("INSERT INTO users(username, email, password) VALUES(?, ?, ?)", (username, email, hashed_password))
-            conn.commit()
-            print("Signup successful!")
-            return True
-        except sqlite3.IntegrityError as e:
-            print(f"Error: {e}")
-            return False
-    else:
-        print("Invalid OTP. Registration failed.")
-        return False
-
-
-# Login function with rate limiting
-def login(conn, username, password):
-    """Attempt to login a user with rate limiting"""
-    cursor = conn.cursor()
-    cursor.execute("SELECT password, failed_attempts, last_attempt_time FROM users WHERE username = ?", (username,))
-    user = cursor.fetchone()
-
-    if user:
-        stored_password, failed_attempts, last_attempt_time = user
-        current_time = datetime.now()
-
-        if last_attempt_time is not None:
-            last_attempt_time = datetime.strptime(last_attempt_time, '%Y-%m-%d %H:%M:%S')
-
-        # Check if the account is currently locked
-        if last_attempt_time and (current_time - last_attempt_time < timedelta(minutes=5)) and failed_attempts >= 3:
-            print("Login attempt blocked due to too many failed attempts. Please try again later.")
-            return False
-
-        if hashlib.sha256(password.encode()).hexdigest() == stored_password:
-            cursor.execute("UPDATE users SET failed_attempts = 0, last_attempt_time = NULL WHERE username = ?", (username,))
-            conn.commit()
-            print("Login successful!")
-            return True
-        else:
-            new_attempts = failed_attempts + 1
-            cursor.execute("UPDATE users SET failed_attempts = ?, last_attempt_time = ? WHERE username = ?", (new_attempts, current_time.strftime('%Y-%m-%d %H:%M:%S'), username))
-            conn.commit()
-            print("Login failed. Incorrect username or password.")
-            return False
-    else:
-        print("Login failed. User does not exist.")
-        return False
+def generate_otp():
+    return randint(100000, 999999)
 
 
 def delete_user(conn, username):
@@ -177,8 +149,16 @@ def delete_user(conn, username):
 
 # Endpoints
 
+def validate_password(password: str) -> bool:
+    # Minimum 8 characters, at least one uppercase letter, one lowercase letter, one number and one special character
+    pattern = re.compile(r'^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$')
+    return bool(pattern.match(password))
+
 @app.post("/signup/")
 def signup(user: SignupUser):
+    if not validate_password(user.password):
+        raise HTTPException(status_code=400, detail="Password does not meet the required standards. Must be at least 8 characters long, contain an uppercase letter, a lowercase letter, a number, and a special character.")
+    
     conn = create_connection("user_data.db")
     if conn is not None:
         cursor = conn.cursor()
@@ -195,10 +175,13 @@ def signup(user: SignupUser):
             raise HTTPException(status_code=400, detail=detail)
 
         # Proceed with creating the new user if no conflicts are found
-        hashed_password = hashlib.sha256(user.password.encode()).hexdigest()
+        hashed_password = bcrypt.hashpw(user.password.encode('utf-8'), bcrypt.gensalt())
+        otp=generate_otp()
         try:
-            cursor.execute("INSERT INTO users(username, email, password, email_verified) VALUES(?, ?, ?, 0)", (user.username, user.email, hashed_password))
+            cursor.execute("INSERT INTO users (username, email, password, registration_otp, email_verified) VALUES (?, ?, ?, ?, 0)",
+                           (user.username, user.email, hashed_password, otp))
             conn.commit()
+            send_otp_email(user.email,otp)
             return {"message": "Signup successful. Please verify your email to complete registration."}
         except sqlite3.IntegrityError as e:
             raise HTTPException(status_code=500, detail=f"Database error: {e}")
@@ -240,9 +223,9 @@ def login(user: LoginUser):
             # Check if account is temporarily blocked
             if last_attempt_time and (datetime.now() - datetime.strptime(last_attempt_time, '%Y-%m-%d %H:%M:%S')) < timedelta(minutes=5) and failed_attempts >= 3:
                 raise HTTPException(status_code=403, detail="Account locked due to multiple failed login attempts. Please try again later.")
-
+            hashed_password = bcrypt.hashpw(user.password.encode('utf-8'), bcrypt.gensalt())
             # Check password
-            if hashlib.sha256(user.password.encode()).hexdigest() == stored_password:
+            if bcrypt.checkpw(user.password.encode('utf-8'), stored_password):
                 # Reset failed_attempts if login is successful
                 cursor.execute("UPDATE users SET failed_attempts = 0, last_attempt_time = NULL WHERE username = ?", (user.username,))
                 conn.commit()
@@ -266,7 +249,9 @@ def forgot_password(request: ForgotPasswordRequest):
         cursor.execute("SELECT email FROM users WHERE username = ?", (request.username,))
         record = cursor.fetchone()
         if record and record[0] == request.email:
-            otp = send_otp_email(request.email)
+            # otp = send_otp_email(request.email)
+            otp=generate_otp()
+            send_otp_email(request.email,otp)
             cursor.execute("UPDATE users SET reset_otp = ? WHERE username = ?", (otp, request.username))
             conn.commit()
             return {"message": "OTP sent to your email. Please check your email to reset your password."}
@@ -278,6 +263,9 @@ def forgot_password(request: ForgotPasswordRequest):
 @app.post("/reset-password/")
 def reset_password(request: ResetPasswordRequest):
     conn = create_connection("user_data.db")
+    if not validate_password(request.new_password):
+        raise HTTPException(status_code=400, detail="Password does not meet the required standards. Must be at least 8 characters long, contain an uppercase letter, a lowercase letter, a number, and a special character.")
+    
     if conn is not None:
         cursor = conn.cursor()
         # Retrieve current OTP and check if it's valid
